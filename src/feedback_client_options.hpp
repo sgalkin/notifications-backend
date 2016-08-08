@@ -1,11 +1,14 @@
 #pragma once
 
-#include <folly/SocketAddress.h>
+#include <string>
+#include <chrono>
 #include <folly/io/async/SSLContext.h>
-#include <vector>
+
+#define FEEDBACK_SANDBOX "feedback.sandbox.push.apple.com:2196"
+#define FEEDBACK "feedback.push.apple.com:2196"
 
 struct FeedbackClientOptions {
-    std::vector<int> shutdownOn;
     folly::SSLContextPtr sslContext;
-    folly::SocketAddress address;
+    std::string address{FEEDBACK};
+    std::chrono::seconds pollInterval{3600};
 };

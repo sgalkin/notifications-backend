@@ -1,10 +1,15 @@
-#include "feedback.hpp"
+#include "feedback_client.hpp"
 
 #include <chrono>
 #include <folly/io/async/AsyncSignalHandler.h>
+#include <wangle/channel/Handler.h>
+#include <wangle/channel/EventBaseHandler.h>
 #include <wangle/channel/AsyncSocketHandler.h>
 #include <wangle/codec/ByteToMessageDecoder.h>
 #include <wangle/codec/LengthFieldBasedFrameDecoder.h>
+
+#include "feedback_client_options.hpp"
+#include "address.hpp"
 
 namespace {
 std::string toUTC(time_t ts) {
@@ -15,24 +20,6 @@ std::string toUTC(time_t ts) {
     return buf;
 }
 }
-
-class FeedbackClient;
-class FeedbackClientSignalHandler : private folly::AsyncSignalHandler {
-public:
-    explicit FeedbackClientSignalHandler(FeedbackClient* client) :
-        folly::AsyncSignalHandler(folly::EventBaseManager::get()->getEventBase()),
-        client_(client) {}
-
-    void install(const std::vector<int>& signals) {
-        for(auto s: signals) registerSignalHandler(s);
-    }
-
-private:
-    void signalReceived(int signum) noexcept override;
-    
-    FeedbackClient* const client_{nullptr};
-};
-
 
 class Feedback {
 //  Timestamp -- A timestamp (as a four-byte time_t value) indicating when APNs determined that the app no longer exists on the device.
@@ -80,17 +67,6 @@ Out& operator<< (Out& o, const Feedback& fb) {
     return o << "feedback received for " << fb.hexToken() << " at " << fb.datetime();
 }
 
-class DisconnectHandler : public wangle::BytesToBytesHandler {
-public:
-    virtual void readEOF(Context* ctx) override {
-        VLOG(3) << "EOF";
-        close(ctx);
-    }
-    virtual void readException(Context* ctx, folly::exception_wrapper e) override {
-        LOG(ERROR) << folly::exceptionStr(e);
-        close(ctx);
-    }
-};
 
 class FeedbackDecoder : public wangle::InboundHandler<std::unique_ptr<folly::IOBuf>, Feedback> {    
 public:
@@ -99,85 +75,95 @@ public:
     }
 };
 
-
-class FeedbackClientHandler : public wangle::InboundHandler<Feedback>
-{
-public:
-    virtual void read(Context* ctx, Feedback msg) override { LOG(INFO) << msg; }
-};
-
 class FeedbackClientPipelineFactory : public wangle::PipelineFactory<FeedbackClientPipeline> {
 public:
-//    explicit FeedbackClientPipelineFactory()
+    explicit FeedbackClientPipelineFactory(FeedbackHandler* handler) : handler_(handler) {
+        CHECK(handler) << "FeedbackHandler not set";
+    }
+    
     FeedbackClientPipeline::Ptr newPipeline(std::shared_ptr<folly::AsyncTransportWrapper> sock) {
         auto pipeline = FeedbackClientPipeline::create();
         (*pipeline)
             .addBack(wangle::AsyncSocketHandler(sock))
-//            .addBack(wangle::EventBaseHandler()) // never writes there
-            .addBack(DisconnectHandler())
+            .addBack(wangle::EventBaseHandler())
             .addBack(wangle::LengthFieldBasedFrameDecoder(2, UINT_MAX, 4, 0, 0))
             .addBack(FeedbackDecoder())
-            .addBack(FeedbackClientHandler())
+            .addBack(handler_)
             .finalize();
         return pipeline;
     }
+    
+private:
+    FeedbackHandler* const handler_;
 };
 
-FeedbackClient::FeedbackClient(FeedbackClientOptions options) :
+FeedbackClient::FeedbackClient(folly::EventBase* ev, FeedbackClientOptions options) :
+    ev_(ev),
     options_(std::make_unique<FeedbackClientOptions>(std::move(options))) {
+    CHECK(ev_) << "EventBase not set";
+    VLOG(3) << "created for " << options_->address
+            << " with poll interval " << std::chrono::duration_cast<std::chrono::seconds>(options_->pollInterval).count() << "s";
 }
             
-FeedbackClient::~FeedbackClient() { CHECK(!ev_) << "call stop()"; }
+FeedbackClient::~FeedbackClient() {
+    CHECK(!ev_) << "call stop()";
+}
     
 void FeedbackClient::start() {
-    ev_ = folly::EventBaseManager::get()->getEventBase();
-    if(!options_->shutdownOn.empty()) {
-        handler_ = std::make_unique<FeedbackClientSignalHandler>(this);
-        handler_->install(options_->shutdownOn);
-    }
+    VLOG(3) << "started";
+    CHECK(ev_->isInEventBaseThread());
 
     bootstrap_ = std::make_unique<wangle::ClientBootstrap<FeedbackClientPipeline>>();
     bootstrap_->group(std::make_shared<wangle::IOThreadPoolExecutor>(1));
     if(options_->sslContext) bootstrap_->sslContext(options_->sslContext);
-    bootstrap_->pipelineFactory(std::make_shared<FeedbackClientPipelineFactory>());
+    bootstrap_->pipelineFactory(std::make_shared<FeedbackClientPipelineFactory>(this));
 
-    folly::AsyncTimeout::schedule(std::chrono::seconds(5), *ev_, [this]() noexcept { ping(); });
-    ev_->loopForever();
+    connect();
 }
             
 void FeedbackClient::stop() {
-    CHECK(ev_);
-    handler_.reset();
+    CHECK(ev_) << "EventBase not set";
+    CHECK(ev_->isInEventBaseThread());
+
+    if(auto pipeline = bootstrap_->getPipeline())
+        pipeline->close().get();
     bootstrap_.reset();
-    ev_->terminateLoopSoon();
+
+    callback_->cancelTimeout();
+    CHECK(!callback_->isScheduled());
+    callback_.reset();
+    
     ev_ = nullptr;
+    VLOG(3) << "stopped";
 }
             
-void FeedbackClient::ping() noexcept {
-    VLOG(3) << "FeedbackClient::ping";
-    try {
-        bootstrap_->connect(options_->address);
-    } catch(folly::AsyncSocketException& ex) {
-        LOG(ERROR) << ex.what();
-    }
+void FeedbackClient::connect() noexcept {
+    CHECK(ev_->runInEventBaseThread([this]() {
+                CHECK(!callback_ || !callback_->isScheduled());
+                callback_ = folly::AsyncTimeout::schedule(options_->pollInterval, *ev_, [this]() noexcept {
+                        // TODO: kill if too many reconnects
+                        try {
+                            bootstrap_->connect(utils::resolveAddress(options_->address));
+                        } catch(folly::AsyncSocketException& ex) {
+                            LOG(ERROR) << ex.what();
+                            connect();
+                        }
+                    });
+            }));
 }
-    
 
-void FeedbackClientSignalHandler::signalReceived(int signum) noexcept {
-    CHECK(client_);
-    client_->stop();
+void FeedbackClient::read(Context* ctx, Feedback msg) {
+    LOG(INFO) << msg;
+    connect();
 }
 
-struct FeedbackServiceOptions {    
-    std::chrono::milliseconds pollInterval;
-};
-    
+void FeedbackClient::readEOF(Context* ctx) {
+    close(ctx);
+    connect();
+}
 
-class FeedbackService final {
-public:
-    explicit FeedbackService(FeedbackServiceOptions options) :
-        options_(std::make_unique<FeedbackServiceOptions>(std::move(options))) {}
-private:
-    std::unique_ptr<FeedbackServiceOptions> options_;
-};
-
+void FeedbackClient::readException(Context* ctx, folly::exception_wrapper e) {
+    LOG(ERROR) << folly::exceptionStr(e);
+    close(ctx);
+    connect();
+}

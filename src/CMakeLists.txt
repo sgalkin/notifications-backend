@@ -3,10 +3,9 @@ add_executable(${CMAKE_PROJECT_NAME}
   flags.cpp
   db.cpp
   ssl.cpp
-  feedback.cpp
-#  dump_filter.cpp
-#  request_filter.cpp
-#  proxy_handler.cpp
+  address.cpp
+  feedback_client.cpp
+  notification_client.cpp
   )
 
 target_link_libraries(${CMAKE_PROJECT_NAME} ${CMAKE_THREAD_LIBS_INIT})

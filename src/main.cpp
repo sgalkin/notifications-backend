@@ -11,8 +11,8 @@
 
 #include <folly/Exception.h>
 #include <folly/ScopeGuard.h>
-#include <folly/dynamic.h>
-#include <folly/json.h>
+//#include <folly/dynamic.h>
+//#include <folly/json.h>
 //#include <folly/SpookyHashV2.h>
 #include <folly/io/async/SSLContext.h>
 #include <folly/io/async/AsyncSignalHandler.h>
@@ -35,24 +35,94 @@
 
 #include "flags.hpp"
 #include "ssl.hpp"
+
+#include "feedback_client.hpp"
 #include "feedback_client_options.hpp"
-#include "feedback.hpp"
-
-//#define APNS_SANDBOX "gateway.sandbox.push.apple.com"
-#define APNS "gateway.push.apple.com"
-#define APNS_PORT 2195
-
-//#define FEEDBACK_SANDBOX "feedback.sandbox.push.apple.com"
-//#define FEEDBACK "feedback.push.apple.com"
-//#define FEEDBACK_PORT 2196
-
-//#define DEFAULT_CHAT_SANDBOX_TOKEN "da085c855269dab30b703c41f556b42e9c3be8473cdd1422927f5b78abbc7ae4"
-#define DEFAULT_VOIP_SANDBOX_TOKEN "81e716225a5b100add0e73181285ec57531692a5d8bc0c83ddab120b49676d54"
+#include "notification_client.hpp"
+#include "notification_client_options.hpp"
 
 #define DEFAULT_ACK_URL "http://foo.bar.com"
 
-#if 0
-//#include <openssl/sha.h>
+#if 1
+
+namespace apple {
+class PushService final {
+public:
+//    PushService(folly::EventBase* ev) : ev_(ev) {}
+    
+    ~PushService() { CHECK(!ev_) << "call stop()"; }
+
+    void start() {
+        ev_ = folly::EventBaseManager::get()->getEventBase();
+/*
+        if(!options_->shutdownOn.empty()) {
+            handler_ = std::make_unique<FeedbackClientSignalHandler>(this);
+            handler_->install(options_->shutdownOn);
+        }
+
+        bootstrap_ = std::make_unique<wangle::ClientBootstrap<FeedbackClientPipeline>>();
+        bootstrap_->group(std::make_shared<wangle::IOThreadPoolExecutor>(1));
+        if(options_->sslContext) bootstrap_->sslContext(options_->sslContext);
+        bootstrap_->pipelineFactory(std::make_shared<FeedbackClientPipelineFactory>());
+
+        folly::AsyncTimeout::schedule(std::chrono::seconds(5), *ev_, [this]() noexcept { ping(); });
+*/
+        signal_handler_ = std::make_unique<SignalHandler>(this, std::vector<int>{SIGINT, SIGTERM});
+        
+        auto ssl = ssl::createContext(FLAGS_cert, FLAGS_key);
+        
+        apn_ = std::make_unique<NotificationClient>(ev_, NotificationClientOptions{ssl, APNS});
+        apn_->start();
+
+        feedback_ = std::make_unique<FeedbackClient>(ev_, FeedbackClientOptions{ssl, FEEDBACK, std::chrono::seconds{5}});
+        feedback_->start();
+        
+        ev_->loopForever();
+    }
+            
+    void stop() {
+        CHECK(ev_) << "service not started";
+
+        signal_handler_.reset();
+        
+        apn_->stop();
+        apn_.reset();
+
+        feedback_->stop();
+        feedback_.reset();
+        
+        ev_->terminateLoopSoon();
+        ev_ = nullptr;       
+    }
+    
+private:
+    class SignalHandler;
+    
+    folly::EventBase* ev_{nullptr};
+    std::unique_ptr<SignalHandler> signal_handler_;
+    std::unique_ptr<NotificationClient> apn_;
+    std::unique_ptr<FeedbackClient> feedback_;
+};
+
+class PushService::SignalHandler : folly::AsyncSignalHandler {
+public:
+    explicit SignalHandler(PushService* host, std::vector<int> signals) :
+        folly::AsyncSignalHandler(folly::EventBaseManager::get()->getEventBase()),
+        host_(host) {
+        for(auto s: signals) registerSignalHandler(s);
+    }
+
+private:
+    virtual void signalReceived(int signum) noexcept override {
+        CHECK(host_);
+        host_->stop();
+    }
+    
+    PushService* const host_;
+};
+    
+}
+
 int main(int argc, char* argv[])
 {
 	gflags::SetUsageMessage(std::move(std::string("Usage: ") + argv[0]));
@@ -67,28 +137,21 @@ int main(int argc, char* argv[])
 
 	google::InstallFailureSignalHandler();
 
+    apple::PushService service;
+    std::thread thread([&service] { service.start(); });
+        
+    thread.join();
+    return EXIT_SUCCESS;
+}
+#endif
+#if 0
+//#include <openssl/sha.h>
+
 //    std::array<uint8_t, SHA_DIGEST_LENGTH> buf;
 //    CHECK(SHA1((uint8_t*)"Hello", 5, buf.data()));
 //    std::string out;
 //    CHECK(folly::hexlify(buf, out));
 //    LOG(INFO) << out;
-    
-
-    FeedbackClient(FeedbackClientOptions{
-                {SIGTERM, SIGINT},
-                ssl::createContext(FLAGS_cert, FLAGS_key),
-                {FLAGS_host, static_cast<uint16_t>(FLAGS_port), true}
-        }).start();
-    
-//    std::thread thread([&client] { client.start(); });
-//    thread.join();
-    
-    return EXIT_SUCCESS;
-}
-#endif
-#if 0
-#define PUSH_CN "Apple Development IOS Push Services: com.skype.hackathon"
-#define VOIP_CN "VoIP Services: com.skype.hackathon"
 
 auto ev = folly::EventBaseManager::get()->getEventBase();
 //    ev->loopForever();
@@ -111,139 +174,11 @@ auto ev = folly::EventBaseManager::get()->getEventBase();
     CHECK(ctx.getSSLCtx(wangle::SSLContextKey(PUSH_CN)));
 #endif
 
-#if 1
-namespace {
-    std::array<uint8_t, 32> token(const std::string& input) {
-        std::array<uint8_t, 32> token;
-        CHECK_EQ(input.size() % 2, 0);
-        CHECK_EQ(input.size() / 2, token.size());
-            
-        int j = 0;
-        auto unhex = [](char c) -> int {
-            return
-            c >= '0' && c <= '9' ? c - '0' :
-            c >= 'A' && c <= 'F' ? c - 'A' + 10 :
-            c >= 'a' && c <= 'f' ? c - 'a' + 10 :
-            -1;
-        };
-
-        for (size_t i = 0; i < input.size(); i += 2) {
-            int highBits = unhex(input[i]);
-            int lowBits = unhex(input[i + 1]);
-            CHECK(highBits >= 0 && lowBits >= 0);
-            token[j++] = (highBits << 4) + lowBits;
-        }
-        return token;
-    }
-
-    std::unique_ptr<folly::IOBuf> header(uint8_t id, uint16_t size)
-    {
-        auto len = sizeof(id) + sizeof(size);
-        auto header = folly::IOBuf::create(len);
-
-        uint16_t sz = htons(size);
-        memcpy(header->writableData(), &id, sizeof(id));
-        memcpy(header->writableData() + sizeof(id), &sz, sizeof(sz));
-
-        header->append(len);
-        return header;    
-    }
-
-    std::unique_ptr<folly::IOBuf> item(uint8_t id, const void* buf, size_t size)
-    {
-        CHECK_EQ((size & ~0xffff), 0);        
-
-        auto item = folly::IOBuf::create(0);
-        item->prependChain(header(id, uint16_t(size)));
-        item->prependChain(folly::IOBuf::copyBuffer(buf, size));
-        return item;
-    }
-}
+#if 0
 
 
-class Notification {
-public:
-    explicit Notification(const std::string& payload, uint32_t ttl) :
-        token_(token(std::string(DEFAULT_VOIP_SANDBOX_TOKEN))), payload_(payload), seq_(htonl(42)), ttl_(htonl(ttl)), prio_(10)
-    {}
-
-    std::unique_ptr<folly::IOBuf> serialize() const {
-        auto notification = folly::IOBuf::create(0);
-        notification->prependChain(item(1, token_.data(), token_.size()));
-        notification->prependChain(item(2, payload_.data(), payload_.size()));
-        notification->prependChain(item(3, &seq_, sizeof(seq_)));
-        notification->prependChain(item(4, &ttl_, sizeof(ttl_)));
-        notification->prependChain(item(5, &prio_, sizeof(prio_)));
-        return notification;
-    }
-
-    size_t size() const {
-        return 5 * 3 + token_.size() + payload_.size() + sizeof(seq_) + sizeof(ttl_) + sizeof(prio_);
-    }
-
-private:    
-    std::array<uint8_t, 32> token_;
-    std::string payload_;
-    uint32_t seq_;
-    uint32_t ttl_;
-    uint8_t prio_;
-};
-
-typedef wangle::Pipeline<folly::IOBufQueue&, Notification> ApnsBinaryPipeline;
 //typedef wangle::Pipeline<folly::IOBufQueue&> FeedbackBinaryPipeline;
 
-class NotificationEncoder : public wangle::MessageToByteEncoder<Notification>
-{
-public:
-    virtual std::unique_ptr<folly::IOBuf> encode(Notification& msg) override
-    {
-        auto len = sizeof(uint8_t) + sizeof(uint32_t);
-        auto message = folly::IOBuf::create(len);
-
-        *message->writableData() = 2;
-        uint32_t size = htonl(msg.size());
-        memcpy(message->writableData() + 1, &size, sizeof(size));
-        message->append(len); 
-
-        message->appendChain(msg.serialize());
-        return message;
-    }
-};
-
-class ApnsErrorHandler : public wangle::InboundHandler<std::unique_ptr<folly::IOBuf>, std::string>
-{
-public:
-    virtual void read(Context* ctx, std::unique_ptr<folly::IOBuf> msg) override {
-        std::string error = folly::hexDump(msg->data(), msg->length());
-        LOG(INFO) << "evicted " << error;
-        ctx->fireRead(error);
-    }
-
-    virtual void readEOF(Context* ctx) override {
-        VLOG(3) << "EOF";
-        //ctx->fireClose();
-    }
-
-    virtual void readException(Context* ctx, folly::exception_wrapper e) override {
-        LOG(ERROR) << folly::exceptionStr(e);
-        //ctx->fireClose();
-    }       
-};
-
-class ApnsBinaryPipelineFactory : public wangle::PipelineFactory<ApnsBinaryPipeline> {
-public:
-    ApnsBinaryPipeline::Ptr newPipeline(std::shared_ptr<folly::AsyncTransportWrapper> sock) {
-        auto pipeline = ApnsBinaryPipeline::create();
-        (*pipeline)
-            .addBack(wangle::AsyncSocketHandler(sock))
-            .addBack(wangle::EventBaseHandler())
-            .addBack(NotificationEncoder())            
-            .addBack(wangle::FixedLengthFrameDecoder(6))
-            .addBack(ApnsErrorHandler())
-            .finalize();
-        return pipeline;
-    }
-};
 
 std::string ack(const std::string& base, const std::string& token)
 {
@@ -273,7 +208,6 @@ int main(int argc, char* argv[])
 //    return 0;
     
     auto tp = std::make_shared<wangle::IOThreadPoolExecutor>(1);
-    auto voip_ssl = ssl::createContext("/home/sgalkin/certs/hv.crt", "/home/sgalkin/certs/hv.key");
        
     auto apns_client = std::make_unique<wangle::ClientBootstrap<ApnsBinaryPipeline>>();
     auto apns = apns_client

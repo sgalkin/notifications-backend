@@ -1,0 +1,21 @@
+cmake_minimum_required (VERSION 2.6)
+
+project (pusher)
+
+find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED)
+
+add_compile_options(-std=c++14)
+add_compile_options(-Wall)
+#add_compile_options(-Wextra)
+#add_compile_options(-Wformat-security)
+#add_compile_options(-Wpedantic)
+#add_compile_options(-Werror)
+add_compile_options(-g)
+add_compile_options(-O3)
+add_compile_options(-fdiagnostics-color=auto)
+
+include_directories(~/opt/include)
+link_directories(~/opt/lib)
+
+add_subdirectory(src)

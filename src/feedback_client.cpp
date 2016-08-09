@@ -143,6 +143,7 @@ void FeedbackClient::connect() noexcept {
                 callback_ = folly::AsyncTimeout::schedule(options_->pollInterval, *ev_, [this]() noexcept {
                         // TODO: kill if too many reconnects
                         try {
+                            // WARNING: blocking operation in reoslveAddress in EvB
                             bootstrap_->connect(utils::resolveAddress(options_->address));
                         } catch(folly::AsyncSocketException& ex) {
                             LOG(ERROR) << ex.what();

@@ -87,7 +87,7 @@ public:
 std::shared_ptr<wangle::PipelineFactory<FeedbackClientPipeline>> FeedbackClientPipelineFactory(
     Client<FeedbackClientPipeline>* client, std::chrono::seconds reconnectTimeout) {
     return SocketPipelineFactory<FeedbackClientPipeline>::create(
-        ReconnectHandler(client, std::move(reconnectTimeout)),
+        ReconnectHandler<FeedbackClientPipeline>(client, std::move(reconnectTimeout)),
         wangle::LengthFieldBasedFrameDecoder(2, UINT_MAX, 4, 0, 0),
         FeedbackDecoder(),
         FeedbackHandler());

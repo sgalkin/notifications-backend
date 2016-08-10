@@ -183,7 +183,7 @@ void Sender::send(NotificationClientPipeline* pipeline, std::string token, std::
 std::shared_ptr<wangle::PipelineFactory<NotificationClientPipeline>> Sender::createPipelineFactory(
     Client<NotificationClientPipeline>* client, std::chrono::seconds reconnectTimeout) {
     return SocketPipelineFactory<NotificationClientPipeline>::create(
-//      ReconnectHandler(client, std::move(reconnectTimeout)),
+        ReconnectHandler<NotificationClientPipeline>(client, std::move(reconnectTimeout)),
         wangle::FixedLengthFrameDecoder(6),
         NotificationStatusDecoder(),
         NotificationStatusHandler(),

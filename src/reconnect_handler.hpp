@@ -7,9 +7,10 @@
 #include <glog/logging.h>
 #include <chrono>
 
+template<typename Pipeline> // TODO: thinks about ClientBase
 class ReconnectHandler : public wangle::BytesToBytesHandler {
 public:
-    ReconnectHandler(Client<typename wangle::Pipeline<rin, win>>* client, std::chrono::milliseconds timeout) :
+    ReconnectHandler(Client<Pipeline>* client, std::chrono::milliseconds timeout) :
         client_(client),
         timeout_(std::move(timeout)) {
         CHECK(client_);
@@ -28,6 +29,6 @@ public:
     }
 
 private:
-    Client<wangle::DefaultPipeline>* const client_;
+    Client<Pipeline>* const client_;
     std::chrono::milliseconds timeout_;
 };

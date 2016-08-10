@@ -6,7 +6,7 @@
 namespace ssl {
 folly::SSLContextPtr createContext(const std::string& cert, const std::string& key) {
     if(cert.empty() || key.empty()) {
-        LOG(INFO) << "certificate or private key is empty"; 
+        LOG(WARNING) << "certificate or private key is empty"; 
         return nullptr;
     }
     
@@ -19,7 +19,7 @@ folly::SSLContextPtr createContext(const std::string& cert, const std::string& k
     ctx->loadCertificate(cert.c_str());
     ctx->loadPrivateKey(key.c_str());
 
-    LOG(INFO) << "context created for CN=" << getCommonName(ctx);
+    VLOG(3) << "context created for CN=" << getCommonName(ctx);
     return ctx;
 }
 

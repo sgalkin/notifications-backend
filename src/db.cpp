@@ -2,6 +2,15 @@
 #include <leveldb/db.h>
 #include <glog/logging.h>
 
+//#include <openssl/sha.h>
+
+//    std::array<uint8_t, SHA_DIGEST_LENGTH> buf;
+//    CHECK(SHA1((uint8_t*)"Hello", 5, buf.data()));
+//    std::string out;
+//    CHECK(folly::hexlify(buf, out));
+//    LOG(INFO) << out;
+
+
 namespace {
 class A
 {

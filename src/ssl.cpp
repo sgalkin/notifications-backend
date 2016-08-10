@@ -28,5 +28,4 @@ std::string getCommonName(folly::SSLContextPtr ctx) {
     auto cn = wangle::SSLUtil::getCommonName(SSL_CTX_get0_certificate(ctx->getSSLCtx()));
     return cn ? *cn : "<unknonw>";
 }
-
 }

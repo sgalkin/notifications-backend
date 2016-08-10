@@ -1,8 +1,9 @@
 #pragma once
 
-#include <string>
 #include <folly/SocketAddress.h>
+#include <folly/futures/Future.h>
+#include <string>
 
 namespace utils {
-folly::SocketAddress resolveAddress(const std::string& address);
+folly::Future<folly::SocketAddress> resolveAddress(const std::string& address);
 }

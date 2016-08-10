@@ -1,11 +1,11 @@
 #include "notification_client.hpp"
+#include "socket_pipeline_factory.hpp"
+#include "reconnect_handler.hpp"
 
-#include <folly/io/IOBuf.h>
-#include <wangle/channel/AsyncSocketHandler.h>
-#include <wangle/channel/EventBaseHandler.h>
+#include <wangle/channel/Handler.h>
 #include <wangle/codec/MessageToByteEncoder.h>
 #include <wangle/codec/FixedLengthFrameDecoder.h>
-#include "notification_client_options.hpp"
+#include <folly/io/IOBuf.h>
 
 namespace {
     std::array<uint8_t, 32> token(const std::string& input) {
@@ -56,27 +56,74 @@ namespace {
 }
 
 
-struct NotificationStatus { 
-enum class NotificationStatus_ {
-    SUCCESS = 0, // No errors encountered
-    PROCESSING_ERROR = 1, // Processing error
-    NO_TOKEN = 2, // Missing device token
-    NO_TOPIC = 3, // Missing topic
-    NO_PAYLOAD = 4, // Missing payload
-    INVALID_TOKEN_SIZE = 5, // Invalid token size
-    INVALID_TOPIC_SIZE = 6, //  Invalid topic size
-    INVALID_PAYLOAD_SIZE = 7, // Invalid payload size
-    INVALID_TOKEN = 8, // Invalid token
-    SHUTDOWN = 10, // Shutdown
-    PROTOCOL_ERROR = 128, // Protocol error (APNs could not parse the notification)
-    UNKNOWN_ERROR = 255 // None (unknown)
+class NotificationStatus
+{
+public:
+    explicit NotificationStatus(std::unique_ptr<folly::IOBuf> buf) :
+        buf_(std::move(buf)) {
+        CHECK_EQ(buf_->length(), 6);
+        CHECK_EQ(*buf_->data(), 8);
+    }
+
+    const std::string& status() const { return names_.at(Status(*(buf_->data() + 1))); }
+    const uint32_t seq() const { uint32_t s{0}; memcpy(&s, buf_->data() + 2, sizeof(s)); return ntohl(s); }
+    
+private:
+    enum class Status : std::uint8_t {
+        SUCCESS = 0, // No errors encountered
+        PROCESSING_ERROR = 1, // Processing error
+        NO_TOKEN = 2, // Missing device token
+        NO_TOPIC = 3, // Missing topic
+        NO_PAYLOAD = 4, // Missing payload
+        INVALID_TOKEN_SIZE = 5, // Invalid token size
+        INVALID_TOPIC_SIZE = 6, //  Invalid topic size
+        INVALID_PAYLOAD_SIZE = 7, // Invalid payload size
+        INVALID_TOKEN = 8, // Invalid token
+        SHUTDOWN = 10, // Shutdown
+        PROTOCOL_ERROR = 128, // Protocol error (APNs could not parse the notification)
+        UNKNOWN_ERROR = 255 // None (unknown)
+    };
+
+    
+    std::unique_ptr<folly::IOBuf> buf_;
+    const std::map<Status, std::string> names_{
+        {Status::SUCCESS, "No errors encountered"},
+        {Status::PROCESSING_ERROR, "Processing error"},
+        {Status::NO_TOKEN, "Missing device token"},
+        {Status::NO_TOPIC, "Missing topic"},
+        {Status::NO_PAYLOAD, "Missing payload"},
+        {Status::INVALID_TOKEN_SIZE, "Invalid token size"},
+        {Status::INVALID_TOPIC_SIZE, "Invalid topic size"},
+        {Status::INVALID_PAYLOAD_SIZE, "Invalid payload size"},
+        {Status::INVALID_TOKEN, "Invalid token"},
+        {Status::SHUTDOWN, "Shutdown"},
+        {Status::PROTOCOL_ERROR, "Protocol error (APNs could not parse the notification)"},
+        {Status::UNKNOWN_ERROR, "None (unknown)"}};
+
 };
 
+template<typename Out>
+Out& operator<< (Out& o, const NotificationStatus& ns) {
+    return o << "notification " << ns.seq() << " failed " << ns.status();
+}
+
+class NotificationStatusDecoder : public wangle::InboundHandler<std::unique_ptr<folly::IOBuf>, NotificationStatus> {    
+public:
+    virtual void read(Context* ctx, std::unique_ptr<folly::IOBuf> buf) override {
+        ctx->fireRead(NotificationStatus(std::move(buf)));
+    }
+};
+
+class NotificationStatusHandler : public wangle::InboundHandler<NotificationStatus, folly::Unit> {
+public:
+    virtual void read(Context* ctx, NotificationStatus status) override {
+        LOG(ERROR) << std::move(status);
+    }    
 };
 
 class Notification {
 public:
-    explicit Notification(std::string token, std::string payload, uint32_t ttl) :
+    Notification(std::string token, std::string payload, uint32_t ttl) :
         token_(::token(std::move(token))),
         payload_(std::move(payload)),
         seq_(htonl(42)),
@@ -123,67 +170,22 @@ public:
     }
 };
 
-class NotificationClientPipelineFactory : public wangle::PipelineFactory<NotificationClientPipeline> {
-public:
-    explicit NotificationClientPipelineFactory(NotificationHandler* handler) :
-        handler_(handler) {
-        CHECK(handler_) << "NotificationHandler not set";
-    }
-    NotificationClientPipeline::Ptr newPipeline(std::shared_ptr<folly::AsyncTransportWrapper> sock) {
-        auto pipeline = NotificationClientPipeline::create();
-        (*pipeline)
-            .addBack(wangle::AsyncSocketHandler(sock))
-            .addBack(wangle::EventBaseHandler())
-            .addBack(wangle::FixedLengthFrameDecoder(6))
-//            .addBack(wangle::NotificationStatusDecoder())
-            .addBack(NotificationEncoder())
-            .addBack(handler_)
-            .finalize();
-        return pipeline;
-    }
-private:
-    NotificationHandler* const handler_;
-};
 
 
-NotificationClient::NotificationClient(folly::EventBase* ev, NotificationClientOptions options) :
-    ev_(ev),
-    options_(std::make_unique<NotificationClientOptions>(std::move(options))) {
-    CHECK(ev_) << "EventBase not set";
-    VLOG(3) << "created for " << options_->address;
+
+void Sender::send(NotificationClientPipeline* pipeline, std::string token, std::string payload) {
+    CHECK(pipeline);
+    VLOG(3) << "sending notification to " << token;
+    pipeline->write(Notification(std::move(token), std::move(payload), 0));
 }
 
-NotificationClient::~NotificationClient() {
-    CHECK(!ev_) << "call stop()";
-}
-    
-void NotificationClient::start() {
-    CHECK(ev_->isInEventBaseThread());
-    VLOG(3) << "started";
-    connect();
-}
 
-void NotificationClient::stop() {
-    CHECK(ev_->isInEventBaseThread());
-    ev_ = nullptr;
-    VLOG(3) << "stopped";
+std::shared_ptr<wangle::PipelineFactory<NotificationClientPipeline>> Sender::createPipelineFactory(
+    Client<NotificationClientPipeline>* client, std::chrono::seconds reconnectTimeout) {
+    return SocketPipelineFactory<NotificationClientPipeline>::create(
+//      ReconnectHandler(client, std::move(reconnectTimeout)),
+        wangle::FixedLengthFrameDecoder(6),
+        NotificationStatusDecoder(),
+        NotificationStatusHandler(),
+        NotificationEncoder());
 }
-
-void NotificationClient::push(std::string token, std::string payload) {
-}
-
-void NotificationClient::connect() {
-    CHECK(ev_->runInEventBaseThread([this]() {
-                VLOG(3) << "AAAA";
-            }));
-}
-
-void NotificationClient::read(Context* ctx, NotificationStatus msg) {
-}
-
-void NotificationClient::readEOF(Context* ctx) {
-}
-
-void NotificationClient::readException(Context* ctx, folly::exception_wrapper e) {
-}
-

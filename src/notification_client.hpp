@@ -1,37 +1,18 @@
 #pragma once
 
-#include <memory>
-#include <folly/io/async/EventBase.h>
+#include "client.hpp"
 #include <wangle/channel/Pipeline.h>
-#include <wangle/channel/Handler.h>
-#include <wangle/bootstrap/ClientBootstrap.h>
+#include <chrono>
 
 class Notification;
-class NotificationStatus;
-class NotificationClientOptions;
-
 typedef wangle::Pipeline<folly::IOBufQueue&, Notification> NotificationClientPipeline;
-typedef wangle::HandlerAdapter<NotificationStatus, Notification> NotificationHandler;
+typedef Client<NotificationClientPipeline> NotificationClient;
 
-class NotificationClient final : public NotificationHandler {
+class Sender {
 public:
-    NotificationClient(folly::EventBase* ev, NotificationClientOptions options);
-    ~NotificationClient();
     
-    void start();
-    void stop();
+    void send(NotificationClientPipeline* pipeline, std::string token, std::string payload);
 
-    void push(std::string token, std::string payload);
-
-private:
-    void connect();
-
-    // NotificationHandler
-    virtual void read(Context* ctx, NotificationStatus msg) override;
-    virtual void readEOF(Context* ctx) override;
-    virtual void readException(Context* ctx, folly::exception_wrapper e) override;
-        
-    folly::EventBase* ev_{nullptr};
-    std::unique_ptr<NotificationClientOptions> options_;
-    std::unique_ptr<wangle::ClientBootstrap<NotificationClientPipeline>> bootstrap_;
+    std::shared_ptr<wangle::PipelineFactory<NotificationClientPipeline>>
+    createPipelineFactory(Client<NotificationClientPipeline>* client, std::chrono::seconds reconnectTimeout);
 };

@@ -4,6 +4,8 @@ project (pusher)
 
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_library(GLOG_LIBRARY_PATH glog)
+find_library(GFLAGS_LIBRARY_PATH gflags)
 
 add_compile_options(-std=c++14)
 add_compile_options(-Wall)

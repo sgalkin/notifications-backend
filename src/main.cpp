@@ -12,6 +12,7 @@
 #include "environment.hpp"
 #include "feedback_client.hpp"
 #include "notification_client.hpp"
+#include "mulitplexed_notification_queue.hpp"
 
 #include "ssl.hpp"
 
@@ -28,7 +29,7 @@
 //#include <wangle/codec/LengthFieldBasedFrameDecoder.h>
 //#include <wangle/codec/MessageToByteEncoder.h>
 //#include <wangle/codec/FixedLengthFrameDecoder.h>
-
+#include <wangle/concurrent/GlobalExecutor.h>
 //#include <wangle/concurrent/IOThreadPoolExecutor.h>
 //#include <wangle/channel/AsyncSocketHandler.h>
 //#include <wangle/channel/EventBaseHandler.h>
@@ -46,7 +47,7 @@
 #include <folly/io/async/AsyncSignalHandler.h>
 //#include <folly/io/async/HHWheelTimer.h>
 #include <folly/io/async/NotificationQueue.h>
-
+#include <folly/AtomicLinkedList.h>
 #include <glog/logging.h>
 //#include <boost/optional/optional_io.hpp>
 
@@ -450,6 +451,15 @@ private:
 };
 
 
+struct A {
+    A() { VLOG(3) << "A::A " << this; }
+    A(const A&) = delete;
+    A& operator=(const A&) = delete;
+    A(A&& a) { VLOG(3) << "M " << &a << " -> " << this; }
+    A& operator=(A&&) = default;
+    ~A() { VLOG(3) << "A::~A " << this; }
+};
+
 int main(int argc, char* argv[])
 {
 	gflags::SetUsageMessage(std::move(std::string("Usage: ") + argv[0]));
@@ -465,14 +475,39 @@ int main(int argc, char* argv[])
 
 	google::InstallFailureSignalHandler();
 
-    folly::NotificationQueue<int> nq;
+    MulitplexedNotificationQueue<A> nm;
+    auto io = std::make_shared<wangle::IOThreadPoolExecutor>(2);
+    wangle::setIOExecutor(io);
+//    std::thread th([&nm](){ nm.start(); });
+    wangle::getIOExecutor()->add([&nm]() { nm.start(); });
+    sleep(2);
+    auto h = [](std::shared_ptr<A>&& p) noexcept { VLOG(3) << "Got it!"; };
+    auto c1 = MulitplexedNotificationQueue<A>::Consumer::make(h);
+    auto c2 = MulitplexedNotificationQueue<A>::Consumer::make(h);
+    wangle::getIOExecutor()->add([&c1, &nm]() { nm.addConsumer(c1.get()); });
+    wangle::getIOExecutor()->add([&c2, &nm]() { nm.addConsumer(c2.get()); });
+                sleep(2);
+                
+    nm.putMessage(A());
+    A a;
+    //nm.putMessage(a);
+    nm.putMessage(std::move(a));
+//    folly::NotificationQueue<int> nq;
+
     
+    sleep(10);
+    wangle::getIOExecutor()->add([&c1, &nm]() { nm.removeConsumer(c1.get()); });
+    wangle::getIOExecutor()->add([&c2, &nm]() { nm.removeConsumer(c2.get()); });
+    sleep(6);
+    nm.stop();
+    io->join();
+    return 0;
     proxygen::HTTPServerOptions options;
     options.threads = 4;
     options.handlerFactories = proxygen::RequestHandlerChain()
         .addThen<SimpleFilterFactory<EnsureNoUpgradeFilter>>()
         .addThen<SimpleFilterFactory<AccessLogFilter>>()
-        .addThen<OKHandlerFactory>(&nq, true)
+//        .addThen<OKHandlerFactory>(&nm, true)
         .build();
     options.idleTimeout = std::chrono::seconds{300};
     options.listenBacklog = 1024;
@@ -499,7 +534,7 @@ int main(int argc, char* argv[])
     auto t = std::thread([&server] { server.start(); });
     
     sleep(10);
-    nq.putMessage(42);
+    //nm.putMessage(42);
 
     t.join();
     return 0;

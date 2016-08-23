@@ -1,18 +1,19 @@
-#define GOOGLE_STRIP_LOG 0
-
 #include <jemalloc/jemalloc.h>
-
+/*
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wbool-compare"
 #include <folly/FBString.h>
 #pragma GCC diagnostic pop
-
+*/
 #include "flags.hpp"
 
 #include "environment.hpp"
 #include "feedback_client.hpp"
 #include "notification_client.hpp"
 #include "mulitplexed_notification_queue.hpp"
+
+#include "conditional_handler_factory.hpp"
+#include "direct_response_handler.hpp"
 
 #include "ssl.hpp"
 
@@ -160,7 +161,7 @@ std::string ack(const std::string& base, const std::string& token)
 
 class EnsureNoUpgradeFilter : public proxygen::Filter {
 public:
-    explicit EnsureNoUpgradeFilter(proxygen::RequestHandler* upstream, proxygen::HTTPMessage*) :
+    explicit EnsureNoUpgradeFilter(proxygen::RequestHandler* upstream) :
         proxygen::Filter(upstream)
     {}
 
@@ -274,8 +275,6 @@ private:
     Context ctx_;
 };
 
-
-
 template<typename Out>
 Out& operator<<(Out& out, const AccessLogFilter::Context& ctx) {
     proxygen::SystemTimePoint tp{proxygen::toSystemTimePoint(ctx.created)};
@@ -292,43 +291,13 @@ Out& operator<<(Out& out, const AccessLogFilter::Context& ctx) {
                << (ctx.error == proxygen::ProxygenError::kErrorNone ? "-" : proxygen::getErrorString(ctx.error));
 }
                   
-template<typename F>
-class SimpleFilterFactory : public proxygen::RequestHandlerFactory {
-public:
-    /*
-    explicit SimpleFilterFactory(C check=[](proxygen::HTTPMessage*){return true;}) :
-        check_(std::forward<C>(check))
-    {}
-    */  
-    virtual void onServerStart(folly::EventBase* evb) noexcept override {}
-    virtual void onServerStop() noexcept override {}
-    virtual proxygen::RequestHandler* onRequest(proxygen::RequestHandler* h, proxygen::HTTPMessage* m) noexcept override {
-        return new F(h, m);
-    }
-private:
-    //C check_;
-};
 
 class OKHandler : public proxygen::RequestHandler {
 public:
-    virtual void onRequest(std::unique_ptr<proxygen::HTTPMessage> headers) noexcept override {
-        VLOG(3) << "onRequest " << this;
-    }
-
-     // Invoked when we get part of body for the request.
-    virtual void onBody(std::unique_ptr<folly::IOBuf> body) noexcept override {
-        VLOG(3) << "onBody " << this;
-    }
-
-    virtual void onEOM() noexcept override {
-        VLOG(3) << "onEOM " << this;
-        proxygen::ResponseBuilder(downstream_)
-            .status(204, "No Content")
-            .closeConnection()
-            .sendWithEOM();
-    }
-    
-    virtual void onUpgrade(proxygen::UpgradeProtocol prot) noexcept override { CHECK(UNLIKELY(false)); }
+    virtual void onRequest(std::unique_ptr<proxygen::HTTPMessage> headers) noexcept override {}
+    virtual void onBody(std::unique_ptr<folly::IOBuf> body) noexcept override {}
+    virtual void onEOM() noexcept override {}
+    virtual void onUpgrade(proxygen::UpgradeProtocol prot) noexcept override {}
 
     /**
      * Invoked when request processing has been completed and nothing more
@@ -338,7 +307,6 @@ public:
      * received, `downstream_` should be considered invalid.
      */
     virtual void requestComplete() noexcept override {
-        VLOG(3) << "requestComplete " << this;
         delete this;
     }
 
@@ -357,108 +325,13 @@ public:
 };
 
 
-
-class OKHandlerFactory : public proxygen::RequestHandlerFactory {
-
-    struct Consumer : public folly::NotificationQueue<int>::Consumer {
-        virtual void messageAvailable(int&& message) override {
-            VLOG(3) << message;
-        }
-    };
-    
-public:
     // /m - monitoring
     // /r - register
     // /p - push
     // /a - acknowledge
     // /s - stats
-    
-    explicit OKHandlerFactory(folly::NotificationQueue<int>* queue, bool x) :
-        queue_(queue), x_(x) {
-        CHECK(queue_);
-        VLOG(3) << "OKHandlerFactory";
-    }
-    
-    virtual void onServerStart(folly::EventBase* evb) noexcept override {
-        VLOG(3) << "onServerStart " << evb;
-        consumer_.reset(new Consumer);
-        consumer_->startConsuming(evb, queue_);
-    }
-    virtual void onServerStop() noexcept override {
-        VLOG(3) << "onServerStop";
-        consumer_->stopConsuming();
-        consumer_.reset();
-        queue_ = nullptr;
-    }
-    virtual proxygen::RequestHandler* onRequest(proxygen::RequestHandler* h, proxygen::HTTPMessage* m) noexcept override {
-        VLOG(3) << "onRequest " << h;
-        m->dumpMessage(4);
-        //if((m->getPath() == "/m") == x_)
-        //{
-        //    auto z = new OKHandler;
-        //    VLOG(3) << "here " << z;
-        //    return z;//proxygen::DirectResponseHandler(204, "No Content", "");
-        // }
-        //VLOG(3) << "here";
-        return new OKHandler;//proxygen::DirectResponseHandler(404, "Not Found", "");
-        /*class DirectResponseHandler : public RequestHandler {
-        public:
-            DirectResponseHandler(int code,
-                                  std::string message,
-                                  std::string body)
-                : code_(code),
-                  message_(message),
-                  body_(folly::IOBuf::copyBuffer(body)) {
-            }
-
-            void onRequest(std::unique_ptr<HTTPMessage> headers) noexcept override {
-            }
-
-            void onBody(std::unique_ptr<folly::IOBuf> body) noexcept override {
-            }
-
-            void onUpgrade(proxygen::UpgradeProtocol prot) noexcept override {
-            }
-
-            void onEOM() noexcept override {
-                ResponseBuilder(downstream_)
-                    .status(code_, message_)
-                    .body(std::move(body_))
-                    .sendWithEOM();
-            }
-
-            void requestComplete() noexcept override {
-                delete this;
-            }
-
-            void onError(ProxygenError err) noexcept override {
-                delete this;
-            }
-
-        private:
-            const int code_;
-            const std::string message_;
-            std::unique_ptr<folly::IOBuf> body_;
-        };
-        */
-            //new OKHandler;
-        //OKHandler();
-    }
-private:
-    folly::NotificationQueue<int>* queue_;
-    folly::ThreadLocalPtr<Consumer> consumer_;
-    bool x_;
-};
 
 
-struct A {
-    A() { VLOG(3) << "A::A " << this; }
-    A(const A&) = delete;
-    A& operator=(const A&) = delete;
-    A(A&& a) { VLOG(3) << "M " << &a << " -> " << this; }
-    A& operator=(A&&) = default;
-    ~A() { VLOG(3) << "A::~A " << this; }
-};
 
 int main(int argc, char* argv[])
 {
@@ -474,6 +347,85 @@ int main(int argc, char* argv[])
 		});
 
 	google::InstallFailureSignalHandler();
+
+    auto cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    folly::checkUnixError(cpus, "unable to detect number of active cpus");
+    VLOG(3) << cpus << " active cpu(s)";
+
+    auto always = [](auto, auto) { return true; };
+    
+    proxygen::HTTPServerOptions options;
+    options.threads = std::max(1l, cpus - 1);
+    options.handlerFactories = proxygen::RequestHandlerChain()
+        .addThen<ConditionalHandlerFactory<EnsureNoUpgradeFilter>>(always)
+        .addThen<ConditionalHandlerFactory<AccessLogFilter>>(
+            always,
+            ConditionalHandlerFactory<AccessLogFilter>::Constructor(
+                [](auto h, auto m) { return new AccessLogFilter(h, m); }))
+        .addThen<ConditionalHandlerFactory<DirectResponseHandler<CloseConnection>>>(
+            [](auto h, auto m) { return h == nullptr; }, 404)
+        .addThen<ConditionalHandlerFactory<DirectResponseHandler<CloseConnection>>>(
+            [](auto h, auto m) { return m->getPath() == "/m"; }, 204)
+        .build();
+    options.idleTimeout = std::chrono::seconds{300};
+    options.listenBacklog = 1024;
+    options.shutdownOn = {SIGTERM, SIGINT}; // temporary
+    options.supportsConnect = false;
+    options.enableContentCompression = true;
+    options.contentCompressionMinimumSize = 1280;
+    options.contentCompressionLevel = 3;
+
+    wangle::SSLContextConfig sslConfig;
+    sslConfig.certificates = {
+        wangle::SSLContextConfig::CertificateInfo(FLAGS_https_cert, FLAGS_https_key, "")};
+    sslConfig.isLocalPrivateKey = true;
+    sslConfig.isDefault = true;
+    
+    std::vector<proxygen::HTTPServer::IPConfig> ips{{
+         folly::SocketAddress(folly::IPAddressV6(), FLAGS_https_port),
+         proxygen::HTTPServer::Protocol::HTTP}};
+    ips.front().sslConfigs = {std::move(sslConfig)};
+    
+    proxygen::HTTPServer server(std::move(options));
+    server.bind(ips);
+    // server.setSessionInfoCallback
+    auto t = std::thread([&server] { server.start(); });
+    
+    //   sleep(10);
+    //nm.putMessage(42);
+
+    t.join();
+    return 0;
+    
+    apn::binary::PushService service;
+    std::thread thread([&service] { service.start(); });
+
+    sleep(5);
+    std::string token{"81e716225a5b100add0e73181285ec57531692a5d8bc0c83ddab120b49676d54"};
+//    for(size_t i = 0; i < 10; ++i) {
+//    while(true) {
+    while(false) {
+        service.send(token, folly::json::serialize(
+                         folly::dynamic::object("url", ack(DEFAULT_ACK_URL, token)),
+                         folly::json::serialization_opts()));
+        sleep(5);
+    }
+    
+    thread.join();
+    return EXIT_SUCCESS;
+}
+
+
+/***
+
+struct A {
+    A() { VLOG(3) << "A::A " << this; }
+    A(const A&) = delete;
+    A& operator=(const A&) = delete;
+    A(A&& a) { VLOG(3) << "M " << &a << " -> " << this; }
+    A& operator=(A&&) = default;
+    ~A() { VLOG(3) << "A::~A " << this; }
+};
 
     MulitplexedNotificationQueue<A> nm;
     auto io = std::make_shared<wangle::IOThreadPoolExecutor>(2);
@@ -502,57 +454,5 @@ int main(int argc, char* argv[])
     nm.stop();
     io->join();
     return 0;
-    proxygen::HTTPServerOptions options;
-    options.threads = 4;
-    options.handlerFactories = proxygen::RequestHandlerChain()
-        .addThen<SimpleFilterFactory<EnsureNoUpgradeFilter>>()
-        .addThen<SimpleFilterFactory<AccessLogFilter>>()
-//        .addThen<OKHandlerFactory>(&nm, true)
-        .build();
-    options.idleTimeout = std::chrono::seconds{300};
-    options.listenBacklog = 1024;
-    options.shutdownOn = {SIGTERM, SIGINT}; // temporary
-    options.supportsConnect = false;
-    options.enableContentCompression = true;
-    options.contentCompressionMinimumSize = 512;
-    options.contentCompressionLevel = 3;
 
-    wangle::SSLContextConfig sslConfig;
-    sslConfig.certificates = {
-        wangle::SSLContextConfig::CertificateInfo(FLAGS_https_cert, FLAGS_https_key, "")};
-    sslConfig.isLocalPrivateKey = true;
-    sslConfig.isDefault = true;
-    
-    std::vector<proxygen::HTTPServer::IPConfig> ips{{
-         folly::SocketAddress(folly::IPAddressV6(), FLAGS_https_port),
-         proxygen::HTTPServer::Protocol::HTTP}};
-    ips.front().sslConfigs = {std::move(sslConfig)};
-    
-    proxygen::HTTPServer server(std::move(options));
-    server.bind(ips);
-    // server.setSessionInfoCallback
-    auto t = std::thread([&server] { server.start(); });
-    
-    sleep(10);
-    //nm.putMessage(42);
-
-    t.join();
-    return 0;
-    
-    apn::binary::PushService service;
-    std::thread thread([&service] { service.start(); });
-
-    sleep(5);
-    std::string token{"81e716225a5b100add0e73181285ec57531692a5d8bc0c83ddab120b49676d54"};
-//    for(size_t i = 0; i < 10; ++i) {
-//    while(true) {
-    while(false) {
-        service.send(token, folly::json::serialize(
-                         folly::dynamic::object("url", ack(DEFAULT_ACK_URL, token)),
-                         folly::json::serialization_opts()));
-        sleep(5);
-    }
-    
-    thread.join();
-    return EXIT_SUCCESS;
-}
+ ***/

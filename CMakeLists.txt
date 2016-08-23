@@ -17,6 +17,8 @@ add_compile_options(-g)
 add_compile_options(-O3)
 add_compile_options(-fdiagnostics-color=auto)
 
+add_definitions(-DGOOGLE_STRIP_LOG=0)
+
 include_directories(~/opt/include)
 link_directories(~/opt/lib)
 

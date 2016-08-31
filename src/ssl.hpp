@@ -5,5 +5,5 @@
 
 namespace ssl {
 folly::SSLContextPtr createContext(const std::string& cert, const std::string& key);
-std::string getCommonName(folly::SSLContextPtr ctx);
+std::string getCommonName(const std::string& cert);
 }

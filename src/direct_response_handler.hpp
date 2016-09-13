@@ -19,7 +19,13 @@ static proxygen::ResponseBuilder& Apply(proxygen::ResponseBuilder& b) {
 }
 };
 
-template<typename ConnectionPolicy = KeepConnection>
+struct NoStore {
+static proxygen::ResponseBuilder& Apply(proxygen::ResponseBuilder& b) {
+    return b.header(proxygen::HTTP_HEADER_CACHE_CONTROL, "no-store");
+}
+};
+
+template<typename... Policy>
 class DirectResponseHandler : public DefaultHandler {
 public:
     explicit DirectResponseHandler(int code, std::string body = "")
@@ -31,11 +37,11 @@ public:
     virtual void onBody(std::unique_ptr<folly::IOBuf> body) noexcept override {}
 
     virtual void onEOM() noexcept override {
-        ConnectionPolicy::Apply(
-            proxygen::ResponseBuilder(downstream_)
-            .status(code_, proxygen::HTTPMessage::getDefaultReason(code_))
-            .body(std::move(body_)))
-            .sendWithEOM();
+        auto rb = proxygen::ResponseBuilder(downstream_);
+        rb.status(code_, proxygen::HTTPMessage::getDefaultReason(code_));
+        for(auto& p: { Policy::Apply... }) p(rb);
+        rb.body(std::move(body_));
+        rb.sendWithEOM();
     }
 
 private:
@@ -43,3 +49,5 @@ private:
     std::unique_ptr<folly::IOBuf> body_;
 };
 
+template<typename... Policy>
+using NoStoreDirectResponseHandler = DirectResponseHandler<NoStore, Policy...>;
